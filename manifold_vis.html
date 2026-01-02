@@ -1,0 +1,1019 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Manifold Studio: Save/Load & Advanced Flows</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; color: #ccc; font-family: 'Segoe UI', sans-serif; }
+        #info { position: absolute; top: 10px; width: 100%; text-align: center; pointer-events: none; z-index: 10; }
+        #label { background: rgba(0,0,0,0.8); padding: 8px 12px; border-radius: 4px; backdrop-filter: blur(4px); border: 1px solid #333; }
+        .lil-gui { --width: 360px; }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <span id="label">Manifold Studio</span><br/>
+        <span style="font-size: 0.8em; color: #888">
+            Create Entities -> Add Projections -> Connect Flows.<br/>
+            Save/Load your configuration via the controls.
+        </span>
+        <input type="file" id="fileInput" style="display: none;" accept=".json" />
+    </div>
+
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.154.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.154.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
+
+        // --- GLOBAL SCENE SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x050505);
+        scene.fog = new THREE.FogExp2(0x050505, 0.015);
+
+        const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 500);
+        camera.position.set(25, 20, 25);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        // --- GRID ENV ---
+        const axesHelper = new THREE.AxesHelper(3);
+        scene.add(axesHelper);
+
+        function createGrid(rotX, rotY, rotZ, posX, posY, posZ) {
+            const grid = new THREE.GridHelper(50, 50, 0x444444, 0x111111);
+            grid.rotation.set(rotX, rotY, rotZ);
+            grid.position.set(posX, posY, posZ);
+            grid.material.opacity = 0.1;
+            grid.material.transparent = true;
+            scene.add(grid);
+        }
+        createGrid(0, 0, 0, 0, -0.01, 0); // Floor
+        createGrid(0, 0, Math.PI/2, -25, 0, 0); // Side
+        createGrid(Math.PI/2, 0, 0, 0, 0, -25); // Back
+
+        // --- PLANE MESH OVERLAYS ---
+        const planeMeshes = {
+            floor: null,
+            side: null,
+            back: null
+        };
+
+        function createPlaneMesh(planeType, density, alpha, color) {
+            // Octant size: 25 units in each positive direction (1/8 of 50x50x50 space)
+            const size = 25;
+            const segments = Math.max(1, Math.floor(density));
+            // PlaneGeometry is centered, so offset by half size to start at origin
+            const offset = size / 2;
+            
+            let geometry, rotation, position;
+            if(planeType === 'floor') {
+                // Floor plane: y=0, extending in +x and +z
+                geometry = new THREE.PlaneGeometry(size, size, segments, segments);
+                rotation = new THREE.Euler(-Math.PI/2, 0, 0); // Face upward
+                position = new THREE.Vector3(offset, 0, offset); // Start at origin, extend in +x, +z
+            } else if(planeType === 'side') {
+                // Side plane: x=0, extending in +y and +z
+                geometry = new THREE.PlaneGeometry(size, size, segments, segments);
+                rotation = new THREE.Euler(0, -Math.PI/2, 0); // Face in +x direction
+                position = new THREE.Vector3(0, offset, offset); // Start at origin, extend in +y, +z
+            } else if(planeType === 'back') {
+                // Back plane: z=0, extending in +x and +y
+                geometry = new THREE.PlaneGeometry(size, size, segments, segments);
+                rotation = new THREE.Euler(0, 0, 0); // Face in +z direction
+                position = new THREE.Vector3(offset, offset, 0); // Start at origin, extend in +x, +y
+            }
+
+            const material = new THREE.MeshBasicMaterial({
+                color: color,
+                opacity: alpha,
+                transparent: true,
+                side: THREE.DoubleSide,
+                wireframe: false,
+                depthWrite: false
+            });
+
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.rotation.copy(rotation);
+            mesh.position.copy(position);
+            return { mesh, geometry, material };
+        }
+
+        function updatePlaneMeshes(params) {
+            // Remove existing meshes
+            if(planeMeshes.floor) {
+                scene.remove(planeMeshes.floor.mesh);
+                planeMeshes.floor.geometry.dispose();
+                planeMeshes.floor.material.dispose();
+                planeMeshes.floor = null;
+            }
+            if(planeMeshes.side) {
+                scene.remove(planeMeshes.side.mesh);
+                planeMeshes.side.geometry.dispose();
+                planeMeshes.side.material.dispose();
+                planeMeshes.side = null;
+            }
+            if(planeMeshes.back) {
+                scene.remove(planeMeshes.back.mesh);
+                planeMeshes.back.geometry.dispose();
+                planeMeshes.back.material.dispose();
+                planeMeshes.back = null;
+            }
+
+            // Create new meshes if enabled
+            if(params.visible) {
+                const color = new THREE.Color(params.color || 0x444444);
+                if(params.floorVisible) {
+                    planeMeshes.floor = createPlaneMesh('floor', params.density, params.alpha, color);
+                    scene.add(planeMeshes.floor.mesh);
+                }
+                if(params.sideVisible) {
+                    planeMeshes.side = createPlaneMesh('side', params.density, params.alpha, color);
+                    scene.add(planeMeshes.side.mesh);
+                }
+                if(params.backVisible) {
+                    planeMeshes.back = createPlaneMesh('back', params.density, params.alpha, color);
+                    scene.add(planeMeshes.back.mesh);
+                }
+            }
+        }
+
+        // --- SHADER CHUNKS ---
+        const noiseGLSL = `
+            vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+            vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+            float snoise(vec3 v) {
+                const vec2  C = vec2(1.0/6.0, 1.0/3.0) ;
+                const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
+                vec3 i  = floor(v + dot(v, C.yyy) );
+                vec3 x0 = v - i + dot(i, C.xxx) ;
+                vec3 g = step(x0.yzx, x0.xyz);
+                vec3 l = 1.0 - g;
+                vec3 i1 = min( g.xyz, l.zxy );
+                vec3 i2 = max( g.xyz, l.zxy );
+                vec3 x1 = x0 - i1 + C.xxx;
+                vec3 x2 = x0 - i2 + C.yyy;
+                vec3 x3 = x0 - D.yyy;
+                i = mod289(i);
+                vec4 p = permute( permute( permute(
+                        i.z + vec4(0.0, i1.z, i2.z, 1.0 ))
+                        + i.y + vec4(0.0, i1.y, i2.y, 1.0 ))
+                        + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
+                float n_ = 0.142857142857;
+                vec3  ns = n_ * D.wyz - D.xzx;
+                vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+                vec4 x_ = floor(j * ns.z);
+                vec4 y_ = floor(j - 7.0 * x_ );
+                vec4 x = x_ *ns.x + ns.yyyy;
+                vec4 y = y_ *ns.x + ns.yyyy;
+                vec4 h = 1.0 - abs(x) - abs(y);
+                vec4 b0 = vec4( x.xy, y.xy );
+                vec4 b1 = vec4( x.zw, y.zw );
+                vec4 s0 = floor(b0)*2.0 + 1.0;
+                vec4 s1 = floor(b1)*2.0 + 1.0;
+                vec4 sh = -step(h, vec4(0.0));
+                vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+                vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+                vec3 p0 = vec3(a0.xy,h.x);
+                vec3 p1 = vec3(a0.zw,h.y);
+                vec3 p2 = vec3(a1.xy,h.z);
+                vec3 p3 = vec3(a1.zw,h.w);
+                vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+                p0 *= norm.x;
+                p1 *= norm.y;
+                p2 *= norm.z;
+                p3 *= norm.w;
+                vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+                m = m * m;
+                return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3) ) );
+            }
+        `;
+
+        const moldingChunk = `
+            uniform float uScaleGlobal;
+            uniform vec3 uSqueeze;
+            uniform float uDistortionStrength;
+
+            vec3 applyMolding(vec3 pos) {
+                vec3 molded = pos * uSqueeze;
+                molded *= uScaleGlobal;
+                float n = snoise(pos * 1.5); 
+                molded += normal * n * uDistortionStrength;
+                return molded;
+            }
+        `;
+
+        // --- SHADER DEFINITIONS ---
+        
+        // 1. Manifold Body
+        const manifoldVertexShader = `
+            varying vec3 vPos;
+            varying vec3 vNormal;
+            ${noiseGLSL}
+            ${moldingChunk}
+            void main() {
+                vNormal = normalMatrix * normal;
+                vec3 moldedPos = applyMolding(position);
+                vPos = moldedPos; 
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(moldedPos, 1.0);
+            }
+        `;
+
+        const manifoldFragmentShader = `
+            varying vec3 vPos;
+            varying vec3 vNormal;
+            uniform vec3 uColor;
+            uniform float uOpacity;
+            uniform float uPorosity;
+            ${noiseGLSL}
+            void main() {
+                float holeNoise = snoise(vPos * 2.5);
+                float threshold = (uPorosity * 1.4) - 1.0; 
+                if (holeNoise < threshold) discard;
+                vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
+                float diff = max(dot(normalize(vNormal), lightDir), 0.0);
+                float rim = pow(1.0 - max(dot(normalize(vNormal), vec3(0,0,1)), 0.0), 3.0);
+                vec3 finalColor = uColor * (diff * 0.6 + 0.4) + (vec3(1.0) * rim * 0.4);
+                gl_FragColor = vec4(finalColor, uOpacity);
+            }
+        `;
+
+        // 2. Projection
+        const projVertexShader = `
+            varying vec3 vPos;
+            uniform float uSkew1;
+            uniform float uSkew2;
+            uniform float uExpand;
+            uniform int uPlane;
+            ${noiseGLSL}
+            ${moldingChunk}
+            void main() {
+                vec3 moldedPos = applyMolding(position);
+                vPos = moldedPos;
+                vec4 worldPos = modelMatrix * vec4(moldedPos, 1.0);
+                vec3 center = vec3(modelMatrix[3][0], modelMatrix[3][1], modelMatrix[3][2]);
+                float height = 0.0;
+                if(uPlane == 0) { // Floor
+                    height = worldPos.y; worldPos.y = 0.0; 
+                    float nl = 1.0 + (uExpand * (height * 0.1));
+                    worldPos.x = (worldPos.x-center.x)*nl + center.x + height*uSkew1;
+                    worldPos.z = (worldPos.z-center.z)*nl + center.z + height*uSkew2;
+                } else if (uPlane == 1) { // Side
+                    height = worldPos.x - 0.0; worldPos.x = 0.0; 
+                    float nl = 1.0 + (uExpand * (height * 0.1));
+                    worldPos.y = (worldPos.y-center.y)*nl + center.y + height*uSkew1;
+                    worldPos.z = (worldPos.z-center.z)*nl + center.z + height*uSkew2;
+                } else if (uPlane == 2) { // Back
+                    height = worldPos.z - 0.0; worldPos.z = 0.0;
+                    float nl = 1.0 + (uExpand * (height * 0.1));
+                    worldPos.x = (worldPos.x-center.x)*nl + center.x + height*uSkew1;
+                    worldPos.y = (worldPos.y-center.y)*nl + center.y + height*uSkew2;
+                }
+                gl_Position = projectionMatrix * viewMatrix * worldPos;
+            }
+        `;
+
+        const projFragmentShader = `
+            varying vec3 vPos;
+            uniform vec3 uColor;
+            uniform float uPorosity;
+            uniform float uOpacity;
+            ${noiseGLSL}
+            void main() {
+                float holeNoise = snoise(vPos * 2.5);
+                float threshold = (uPorosity * 1.4) - 1.0; 
+                if (holeNoise < threshold) discard;
+                gl_FragColor = vec4(uColor, uOpacity);
+            }
+        `;
+
+
+        // --- UTILS & MATH ---
+        // Calculate where the center of a manifold projects to on a specific plane
+        function getProjectedCenter(worldPos, params) {
+            const res = worldPos.clone();
+            const p = parseInt(params.plane);
+            if(p === 0) { // Floor
+                res.y = 0;
+                res.x += worldPos.y * params.skew1;
+                res.z += worldPos.y * params.skew2;
+            } else if(p === 1) { // Side
+                const h = worldPos.x - 0;
+                res.x = 0;
+                res.y += h * params.skew1;
+                res.z += h * params.skew2;
+            } else if(p === 2) { // Back
+                const h = worldPos.z - 0;
+                res.z = 0;
+                res.x += h * params.skew1;
+                res.y += h * params.skew2;
+            }
+            return res;
+        }
+
+        // --- CLASSES ---
+
+        // 1. Projection Area
+        class Projection {
+            constructor(parent, id, config = null) {
+                this.parent = parent;
+                this.id = id;
+                this.uid = `${parent.uid}_P${id}`;
+                
+                // Defaults
+                this.params = {
+                    visible: true,
+                    plane: 0,
+                    skew1: (Math.random()-0.5), skew2: (Math.random()-0.5),
+                    expand: 0.0,
+                    color: parent.params.color, // Default inherit
+                    opacity: 0.3,
+                    inheritColor: true
+                };
+
+                // Override with loaded config
+                if(config) Object.assign(this.params, config);
+
+                this.material = new THREE.ShaderMaterial({
+                    uniforms: {
+                        uColor: { value: new THREE.Color(this.params.color) },
+                        uPorosity: { value: parent.params.porosity },
+                        uOpacity: { value: this.params.opacity },
+                        uScaleGlobal: { value: parent.params.scale },
+                        uSqueeze: { value: new THREE.Vector3(1,1,1) },
+                        uDistortionStrength: { value: parent.params.distortion },
+                        uPlane: { value: this.params.plane },
+                        uSkew1: { value: this.params.skew1 },
+                        uSkew2: { value: this.params.skew2 },
+                        uExpand: { value: this.params.expand }
+                    },
+                    vertexShader: projVertexShader,
+                    fragmentShader: projFragmentShader,
+                    side: THREE.DoubleSide,
+                    transparent: true,
+                    depthWrite: false
+                });
+
+                this.mesh = new THREE.Mesh(parent.geometry, this.material);
+                scene.add(this.mesh);
+                
+                this.guiFolder = null;
+            }
+
+            update() {
+                // Sync pos with parent
+                this.mesh.position.copy(this.parent.mesh.position);
+                this.mesh.visible = this.params.visible && this.parent.params.visible;
+
+                const p = this.parent.params;
+                const m = this.params;
+                const u = this.material.uniforms;
+
+                // Color Logic
+                if(m.inheritColor) m.color = p.color;
+                u.uColor.value = new THREE.Color(m.color);
+
+                // Inherited Shapes
+                u.uPorosity.value = p.porosity;
+                u.uScaleGlobal.value = p.scale;
+                u.uSqueeze.value = new THREE.Vector3(p.squeezeX, p.squeezeY, p.squeezeZ);
+                u.uDistortionStrength.value = p.distortion;
+
+                // Independent Params
+                u.uOpacity.value = m.opacity;
+                u.uPlane.value = parseInt(m.plane);
+                u.uSkew1.value = m.skew1;
+                u.uSkew2.value = m.skew2;
+                u.uExpand.value = m.expand;
+            }
+
+            dispose() {
+                scene.remove(this.mesh);
+                this.material.dispose();
+                if(this.guiFolder) this.guiFolder.destroy();
+            }
+
+            serialize() {
+                return { ...this.params };
+            }
+        }
+
+        // 2. Manifold Entity
+        class Manifold {
+            constructor(id, config = null) {
+                this.id = id;
+                this.uid = `M${id}`;
+                this.projections = [];
+
+                this.params = {
+                    visible: true,
+                    x: (Math.random()-0.5)*15, y: 5, z: (Math.random()-0.5)*15,
+                    color: Math.random() * 0xffffff,
+                    opacity: 0.9,
+                    porosity: 0.0,
+                    scale: 1.0,
+                    squeezeX: 1.0, squeezeY: 1.0, squeezeZ: 1.0,
+                    distortion: 0.0
+                };
+
+                if(config) {
+                    // Load basic params
+                    const { projections, ...rest } = config;
+                    Object.assign(this.params, rest);
+                }
+
+                this.geometry = new THREE.IcosahedronGeometry(1, 20);
+                this.material = new THREE.ShaderMaterial({
+                    uniforms: {
+                        uColor: { value: new THREE.Color(this.params.color) },
+                        uOpacity: { value: this.params.opacity },
+                        uPorosity: { value: this.params.porosity },
+                        uScaleGlobal: { value: this.params.scale },
+                        uSqueeze: { value: new THREE.Vector3(1,1,1) },
+                        uDistortionStrength: { value: this.params.distortion }
+                    },
+                    vertexShader: manifoldVertexShader,
+                    fragmentShader: manifoldFragmentShader,
+                    side: THREE.DoubleSide,
+                    transparent: true
+                });
+
+                this.mesh = new THREE.Mesh(this.geometry, this.material);
+                scene.add(this.mesh);
+                
+                // Init GUI
+                this.buildGUI();
+
+                // Load Projections or Create Default
+                if(config && config.projections) {
+                    config.projections.forEach((pConf, idx) => {
+                        this.addProjection(idx, pConf);
+                    });
+                } else {
+                    this.addProjection(0);
+                }
+                
+                this.update();
+            }
+
+            addProjection(id = null, config = null) {
+                const idx = id !== null ? id : this.projections.length;
+                const proj = new Projection(this, idx, config);
+                this.projections.push(proj);
+                this.buildProjGUI(proj);
+                this.update();
+                updateAllFlows();
+            }
+
+            removeProjection(proj) {
+                proj.dispose();
+                this.projections = this.projections.filter(p => p !== proj);
+                updateAllFlows();
+            }
+
+            update() {
+                this.mesh.visible = this.params.visible;
+                this.mesh.position.set(this.params.x, this.params.y, this.params.z);
+
+                const u = this.material.uniforms;
+                const p = this.params;
+                
+                u.uColor.value = new THREE.Color(p.color);
+                u.uOpacity.value = p.opacity;
+                u.uPorosity.value = p.porosity;
+                u.uScaleGlobal.value = p.scale;
+                u.uSqueeze.value = new THREE.Vector3(p.squeezeX, p.squeezeY, p.squeezeZ);
+                u.uDistortionStrength.value = p.distortion;
+
+                this.projections.forEach(p => p.update());
+            }
+
+            buildGUI() {
+                this.guiFolder = entitiesFolder.addFolder(`📌 ${this.uid}`);
+                
+                const main = this.guiFolder.addFolder("Properties");
+                main.add(this.params, 'visible').onChange(() => { this.update(); updateAllFlows(); });
+                main.addColor(this.params, 'color').onChange(() => { this.update(); updateAllFlows(); });
+                main.add(this.params, 'opacity', 0, 1).onChange(() => this.update());
+                main.add(this.params, 'porosity', 0, 1).onChange(() => this.update());
+                
+                const position = this.guiFolder.addFolder("Position");
+                position.add(this.params, 'x', -20, 20).onChange(() => { this.update(); updateAllFlows(); });
+                position.add(this.params, 'y', 1, 20).onChange(() => { this.update(); updateAllFlows(); });
+                position.add(this.params, 'z', -20, 20).onChange(() => { this.update(); updateAllFlows(); });
+                
+                const shape = this.guiFolder.addFolder("Molding");
+                shape.add(this.params, 'scale', 0.5, 3).onChange(() => this.update());
+                shape.add(this.params, 'squeezeX', 0.1, 3).onChange(() => this.update());
+                shape.add(this.params, 'squeezeY', 0.1, 3).onChange(() => this.update());
+                shape.add(this.params, 'squeezeZ', 0.1, 3).onChange(() => this.update());
+                shape.add(this.params, 'distortion', 0, 3).onChange(() => this.update());
+
+                this.guiFolder.add({ addP: () => this.addProjection() }, 'addP').name("+ New Projection");
+                this.guiFolder.add({ rem: () => app.removeManifold(this.id) }, 'rem').name("❌ Delete");
+            }
+
+            buildProjGUI(proj) {
+                proj.guiFolder = this.guiFolder.addFolder(`📐 ${proj.uid}`);
+                proj.guiFolder.add(proj.params, 'visible').name("Visible").onChange(() => { proj.update(); updateAllFlows(); });
+                
+                const colorGroup = proj.guiFolder.addFolder("Color");
+                colorGroup.add(proj.params, 'inheritColor').name("Link to Entity").onChange(() => {
+                    if(proj.params.inheritColor) {
+                        proj.params.color = this.params.color;
+                        colorCtrl.updateDisplay();
+                    }
+                    proj.update();
+                });
+                const colorCtrl = colorGroup.addColor(proj.params, 'color').name("Custom").onChange(() => {
+                    proj.params.inheritColor = false;
+                    proj.update();
+                });
+                
+                const projectionGroup = proj.guiFolder.addFolder("Projection");
+                projectionGroup.add(proj.params, 'plane', { "Floor": 0, "Side": 1, "Back": 2 }).onChange(() => { proj.update(); updateAllFlows(); });
+                projectionGroup.add(proj.params, 'opacity', 0, 1).onChange(() => proj.update());
+                projectionGroup.add(proj.params, 'skew1', -2, 2).name("Skew X").onChange(() => { proj.update(); updateAllFlows(); });
+                projectionGroup.add(proj.params, 'skew2', -2, 2).name("Skew Y").onChange(() => { proj.update(); updateAllFlows(); });
+                projectionGroup.add(proj.params, 'expand', -1, 3).name("Expand").onChange(() => { proj.update(); updateAllFlows(); });
+                
+                proj.guiFolder.add({ del: () => this.removeProjection(proj) }, 'del').name("🗑️ Delete");
+            }
+
+            dispose() {
+                scene.remove(this.mesh);
+                this.geometry.dispose();
+                this.material.dispose();
+                this.projections.forEach(p => p.dispose());
+                this.guiFolder.destroy();
+            }
+
+            serialize() {
+                return {
+                    ...this.params,
+                    projections: this.projections.map(p => p.serialize())
+                };
+            }
+        }
+
+        // 3. Custom Projection-to-Projection Connection
+        class CustomFlow {
+            constructor(sourceUid, targetUid) {
+                this.sourceUid = sourceUid; // e.g., "M1_P0"
+                this.targetUid = targetUid;
+                this.params = {
+                    visible: true,
+                    density: 15,
+                    spread: 1.0,
+                    curve: 2.0,
+                    opacity: 0.3,
+                    color: '#ffffff'
+                };
+                this.mesh = null;
+                this.guiFolder = null;
+            }
+            
+            update() {
+                if(this.mesh) { scene.remove(this.mesh); this.mesh.geometry.dispose(); this.mesh = null; }
+                if(!this.params.visible) return;
+
+                const startObj = findProjectionByUid(this.sourceUid);
+                const endObj = findProjectionByUid(this.targetUid);
+
+                if(!startObj || !endObj || !startObj.params.visible || !endObj.params.visible) return;
+
+                // Calculate center points in world space
+                const p1 = getProjectedCenter(startObj.parent.mesh.position, startObj.params);
+                const p2 = getProjectedCenter(endObj.parent.mesh.position, endObj.params);
+
+                const positions = [];
+                const colors = [];
+                const c = new THREE.Color(this.params.color);
+
+                generateBundle(p1, p2, c, c, this.params.density, this.params.spread, this.params.curve, positions, colors);
+                
+                if(positions.length > 0) {
+                    const geo = new THREE.BufferGeometry();
+                    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+                    const mat = new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: this.params.opacity, blending: THREE.AdditiveBlending, depthWrite: false });
+                    this.mesh = new THREE.LineSegments(geo, mat);
+                    scene.add(this.mesh);
+                }
+            }
+
+            buildGUI(folder) {
+                this.guiFolder = folder.addFolder(`🔀 ${this.sourceUid} ➡ ${this.targetUid}`);
+                this.guiFolder.add(this.params, 'visible').onChange(() => this.update());
+                const flowParams = this.guiFolder.addFolder("Parameters");
+                flowParams.add(this.params, 'density', 1, 50).onChange(() => this.update());
+                flowParams.add(this.params, 'spread', 0, 3).onChange(() => this.update());
+                flowParams.add(this.params, 'curve', -5, 5).onChange(() => this.update());
+                flowParams.add(this.params, 'opacity', 0, 1).onChange(() => this.update());
+                flowParams.addColor(this.params, 'color').onChange(() => this.update());
+                this.guiFolder.add({ del: () => app.removeCustomFlow(this) }, 'del').name("🗑️ Remove");
+            }
+
+            dispose() {
+                if(this.mesh) scene.remove(this.mesh);
+                if(this.guiFolder) this.guiFolder.destroy();
+            }
+
+            serialize() {
+                return { sourceUid: this.sourceUid, targetUid: this.targetUid, params: this.params };
+            }
+        }
+
+
+        // --- APPLICATION STATE ---
+        const manifolds = [];
+        const customFlows = [];
+        let globalFlowMesh = null; // Entity-to-Entity
+        let umbilicalMesh = null;  // Entity-to-Shadow
+
+        const gui = new GUI({ title: "Manifold Studio" });
+
+        // Global Config
+        const globalConfig = {
+            autoEntityFlow: true,
+            autoUmbilical: true,
+            save: () => saveScene(),
+            load: () => document.getElementById('fileInput').click(),
+            
+            // New Flow Creation
+            sourceSelect: "",
+            targetSelect: "",
+            addFlow: () => createCustomFlow()
+        };
+
+        // Plane Mesh Settings
+        const planeMeshConfig = {
+            visible: false,
+            floorVisible: true,
+            sideVisible: true,
+            backVisible: true,
+            density: 10,
+            alpha: 0.15,
+            color: 0x444444
+        };
+
+        // Global Flow Settings
+        const entityFlowConfig = {
+            density: 15,
+            spread: 1.0,
+            curve: 2.0,
+            opacity: 0.2
+        };
+
+        const umbilicalFlowConfig = {
+            density: 8,
+            spread: 0.5,
+            curve: 0.5,
+            opacity: 0.1
+        };
+
+        // --- REORGANIZED GUI STRUCTURE ---
+        // Top level: Global Settings (expanded by default)
+        const globalFolder = gui.addFolder("⚙️ Global Settings");
+        globalFolder.open();
+
+        // Scene Settings (plane meshes)
+        const sceneFolder = globalFolder.addFolder("Scene Planes");
+        sceneFolder.add(planeMeshConfig, 'visible').name("Enable Planes").onChange(() => updatePlaneMeshes(planeMeshConfig));
+        sceneFolder.add(planeMeshConfig, 'floorVisible').name("Floor").onChange(() => updatePlaneMeshes(planeMeshConfig));
+        sceneFolder.add(planeMeshConfig, 'sideVisible').name("Side Wall").onChange(() => updatePlaneMeshes(planeMeshConfig));
+        sceneFolder.add(planeMeshConfig, 'backVisible').name("Back Wall").onChange(() => updatePlaneMeshes(planeMeshConfig));
+        sceneFolder.add(planeMeshConfig, 'density', 1, 50, 1).name("Grid Density").onChange(() => updatePlaneMeshes(planeMeshConfig));
+        sceneFolder.add(planeMeshConfig, 'alpha', 0, 1, 0.01).name("Opacity").onChange(() => {
+            if(planeMeshes.floor) planeMeshes.floor.material.opacity = planeMeshConfig.alpha;
+            if(planeMeshes.side) planeMeshes.side.material.opacity = planeMeshConfig.alpha;
+            if(planeMeshes.back) planeMeshes.back.material.opacity = planeMeshConfig.alpha;
+        });
+        sceneFolder.addColor(planeMeshConfig, 'color').name("Color").onChange(() => updatePlaneMeshes(planeMeshConfig));
+
+        // Flow Settings
+        const flowFolder = globalFolder.addFolder("Flow Settings");
+        flowFolder.add(globalConfig, 'autoEntityFlow').name("Chain Entities").onChange(updateAllFlows);
+        flowFolder.add(globalConfig, 'autoUmbilical').name("Show Umbilicals").onChange(updateAllFlows);
+        
+        // Entity Chain Flow Parameters
+        const entityFlowParams = flowFolder.addFolder("Entity Chain");
+        entityFlowParams.add(entityFlowConfig, 'density', 1, 50, 1).name("Density").onChange(updateAllFlows);
+        entityFlowParams.add(entityFlowConfig, 'spread', 0, 3, 0.1).name("Spread").onChange(updateAllFlows);
+        entityFlowParams.add(entityFlowConfig, 'curve', -5, 5, 0.1).name("Curve").onChange(updateAllFlows);
+        entityFlowParams.add(entityFlowConfig, 'opacity', 0, 1, 0.01).name("Opacity").onChange(updateAllFlows);
+        
+        // Umbilical Flow Parameters
+        const umbilicalFlowParams = flowFolder.addFolder("Umbilical");
+        umbilicalFlowParams.add(umbilicalFlowConfig, 'density', 1, 50, 1).name("Density").onChange(updateAllFlows);
+        umbilicalFlowParams.add(umbilicalFlowConfig, 'spread', 0, 3, 0.1).name("Spread").onChange(updateAllFlows);
+        umbilicalFlowParams.add(umbilicalFlowConfig, 'curve', -5, 5, 0.1).name("Curve").onChange(updateAllFlows);
+        umbilicalFlowParams.add(umbilicalFlowConfig, 'opacity', 0, 1, 0.01).name("Opacity").onChange(updateAllFlows);
+
+        // File I/O
+        const ioFolder = globalFolder.addFolder("File I/O");
+        ioFolder.add(globalConfig, 'save').name("💾 Save Config");
+        ioFolder.add(globalConfig, 'load').name("📂 Load Config");
+
+        // Entities Section
+        const entitiesFolder = gui.addFolder("📦 Entities");
+        entitiesFolder.open();
+
+        // Custom Connections Section
+        const customFlowFolder = gui.addFolder("🔗 Custom Connections");
+        
+        // --- HELPER FUNCTIONS ---
+
+        function findProjectionByUid(uid) {
+            for(let m of manifolds) {
+                for(let p of m.projections) {
+                    if(p.uid === uid) return p;
+                }
+            }
+            return null;
+        }
+
+        function getAllProjectionUids() {
+            let uids = [];
+            manifolds.forEach(m => m.projections.forEach(p => uids.push(p.uid)));
+            return uids;
+        }
+
+        // Logic to populate the dropdowns for selecting projections
+        let sourceCtrl, targetCtrl;
+        let customFlowCreate = null;
+        function refreshFlowDropdowns() {
+            const uids = getAllProjectionUids();
+            if(!uids.length) uids.push("No Projections");
+            
+            // Destroy existing dropdowns if they exist
+            if(sourceCtrl) sourceCtrl.destroy();
+            if(targetCtrl) targetCtrl.destroy();
+            
+            globalConfig.sourceSelect = uids[0];
+            globalConfig.targetSelect = uids.length > 1 ? uids[1] : uids[0];
+
+            // Create or get the Create Connection folder
+            if(!customFlowCreate) {
+                customFlowCreate = customFlowFolder.addFolder("Create Connection");
+            }
+            
+            sourceCtrl = customFlowCreate.add(globalConfig, 'sourceSelect', uids).name("Source");
+            targetCtrl = customFlowCreate.add(globalConfig, 'targetSelect', uids).name("Target");
+        }
+        
+        // Initial setup of dropdown
+        refreshFlowDropdowns();
+        customFlowCreate.add(globalConfig, 'addFlow').name("+ Add Connection");
+        
+        // Initialize plane meshes
+        updatePlaneMeshes(planeMeshConfig);
+
+
+        // --- CORE LOGIC ---
+
+        function updateAllFlows() {
+            // 1. Entity Chain
+            if(globalFlowMesh) { scene.remove(globalFlowMesh); globalFlowMesh.geometry.dispose(); globalFlowMesh = null; }
+            if(globalConfig.autoEntityFlow && manifolds.length > 1) {
+                const pos = [], col = [];
+                for(let i=0; i<manifolds.length-1; i++) {
+                    if(!manifolds[i].params.visible || !manifolds[i+1].params.visible) continue;
+                    generateBundle(manifolds[i].mesh.position, manifolds[i+1].mesh.position, 
+                        new THREE.Color(manifolds[i].params.color), new THREE.Color(manifolds[i+1].params.color), 
+                        entityFlowConfig.density, entityFlowConfig.spread, entityFlowConfig.curve, pos, col);
+                }
+                if(pos.length) {
+                    const geo = new THREE.BufferGeometry();
+                    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+                    geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+                    globalFlowMesh = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ 
+                        vertexColors:true, 
+                        opacity: entityFlowConfig.opacity, 
+                        transparent:true, 
+                        blending:THREE.AdditiveBlending, 
+                        depthWrite:false 
+                    }));
+                    scene.add(globalFlowMesh);
+                }
+            }
+
+            // 2. Umbilicals (Parent -> Shadow)
+            if(umbilicalMesh) { scene.remove(umbilicalMesh); umbilicalMesh.geometry.dispose(); umbilicalMesh = null; }
+            if(globalConfig.autoUmbilical) {
+                const pos = [], col = [];
+                manifolds.forEach(m => {
+                    if(!m.params.visible) return;
+                    const c = new THREE.Color(m.params.color);
+                    m.projections.forEach(p => {
+                        if(!p.params.visible) return;
+                        const target = getProjectedCenter(m.mesh.position, p.params);
+                        generateBundle(m.mesh.position, target, c, new THREE.Color(p.params.color), 
+                            umbilicalFlowConfig.density, umbilicalFlowConfig.spread, umbilicalFlowConfig.curve, pos, col);
+                    });
+                });
+                if(pos.length) {
+                    const geo = new THREE.BufferGeometry();
+                    geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+                    geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+                    umbilicalMesh = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ 
+                        vertexColors:true, 
+                        opacity: umbilicalFlowConfig.opacity, 
+                        transparent:true, 
+                        blending:THREE.AdditiveBlending, 
+                        depthWrite:false 
+                    }));
+                    scene.add(umbilicalMesh);
+                }
+            }
+
+            // 3. Custom Flows
+            customFlows.forEach(cf => cf.update());
+        }
+
+        // --- MATH: FLOW GENERATION ---
+        function generateBundle(p1, p2, c1, c2, count, spread, curve, posArr, colArr) {
+            for(let i=0; i<count; i++) {
+                const off1 = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).multiplyScalar(spread);
+                const off2 = new THREE.Vector3(Math.random()-0.5, Math.random()-0.5, Math.random()-0.5).multiplyScalar(spread);
+                const start = p1.clone().add(off1);
+                const end = p2.clone().add(off2);
+                const mid = start.clone().lerp(end, 0.5);
+                mid.y += curve + (Math.random()-0.5);
+                mid.x += (Math.random()-0.5)*curve;
+
+                const segs = 15;
+                for(let s=0; s<segs; s++) {
+                    const t1 = s/segs; const t2 = (s+1)/segs;
+                    const pt1 = getBezier(t1, start, mid, end);
+                    const pt2 = getBezier(t2, start, mid, end);
+                    posArr.push(pt1.x, pt1.y, pt1.z, pt2.x, pt2.y, pt2.z);
+                    const colA = c1.clone().lerp(c2, t1);
+                    const colB = c1.clone().lerp(c2, t2);
+                    colArr.push(colA.r, colA.g, colA.b, colB.r, colB.g, colB.b);
+                }
+            }
+        }
+        function getBezier(t, p0, p1, p2) {
+            const k = 1-t;
+            return new THREE.Vector3(k*k*p0.x + 2*k*t*p1.x + t*t*p2.x, k*k*p0.y + 2*k*t*p1.y + t*t*p2.y, k*k*p0.z + 2*k*t*p1.z + t*t*p2.z);
+        }
+
+        // --- APP API ---
+        const app = {
+            addManifold: (config=null) => {
+                const id = manifolds.length ? Math.max(...manifolds.map(m=>m.id))+1 : 1;
+                const m = new Manifold(id, config);
+                manifolds.push(m);
+                updateAllFlows();
+                refreshFlowDropdowns();
+            },
+            removeManifold: (id) => {
+                const m = manifolds.find(x => x.id === id);
+                if(m) {
+                    m.dispose();
+                    manifolds.splice(manifolds.indexOf(m), 1);
+                    updateAllFlows();
+                    refreshFlowDropdowns();
+                }
+            },
+            createCustomFlow: () => {
+                if(globalConfig.sourceSelect === globalConfig.targetSelect) return;
+                const flow = new CustomFlow(globalConfig.sourceSelect, globalConfig.targetSelect);
+                customFlows.push(flow);
+                flow.buildGUI(customFlowFolder);
+                flow.update();
+            },
+            removeCustomFlow: (flow) => {
+                flow.dispose();
+                const idx = customFlows.indexOf(flow);
+                if(idx > -1) customFlows.splice(idx, 1);
+            }
+        };
+
+        // Hook up the wrapper function for GUI
+        function createCustomFlow() { app.createCustomFlow(); }
+
+        // Add Entity button in entities folder
+        entitiesFolder.add(app, 'addManifold').name("+ Add Entity");
+
+
+        // --- SAVE / LOAD SYSTEM ---
+
+        function saveScene() {
+            const data = {
+                manifolds: manifolds.map(m => m.serialize()),
+                customFlows: customFlows.map(f => f.serialize()),
+                globals: { 
+                    autoEntityFlow: globalConfig.autoEntityFlow, 
+                    autoUmbilical: globalConfig.autoUmbilical,
+                    planeMesh: { ...planeMeshConfig },
+                    entityFlow: { ...entityFlowConfig },
+                    umbilicalFlow: { ...umbilicalFlowConfig }
+                }
+            };
+            const blob = new Blob([JSON.stringify(data, null, 2)], {type : 'application/json'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'manifold_scene.json';
+            a.click();
+        }
+
+        document.getElementById('fileInput').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if(!file) return;
+            const reader = new FileReader();
+            reader.onload = (evt) => {
+                try {
+                    const data = JSON.parse(evt.target.result);
+                    loadScene(data);
+                } catch(err) { console.error("Load failed", err); alert("Invalid JSON"); }
+            };
+            reader.readAsText(file);
+        });
+
+        function loadScene(data) {
+            // Clear current
+            while(manifolds.length > 0) app.removeManifold(manifolds[0].id);
+            while(customFlows.length > 0) app.removeCustomFlow(customFlows[0]);
+
+            // Restore Globals
+            if(data.globals) {
+                globalConfig.autoEntityFlow = data.globals.autoEntityFlow !== undefined ? data.globals.autoEntityFlow : true;
+                globalConfig.autoUmbilical = data.globals.autoUmbilical !== undefined ? data.globals.autoUmbilical : true;
+                if(data.globals.planeMesh) {
+                    Object.assign(planeMeshConfig, data.globals.planeMesh);
+                    updatePlaneMeshes(planeMeshConfig);
+                }
+                if(data.globals.entityFlow) {
+                    Object.assign(entityFlowConfig, data.globals.entityFlow);
+                }
+                if(data.globals.umbilicalFlow) {
+                    Object.assign(umbilicalFlowConfig, data.globals.umbilicalFlow);
+                }
+            }
+
+            // Restore Manifolds
+            if(data.manifolds) {
+                data.manifolds.forEach(mConf => {
+                    // Manifold constructor handles sub-projections
+                    app.addManifold(mConf);
+                });
+            }
+
+            // Restore Flows
+            if(data.customFlows) {
+                data.customFlows.forEach(fConf => {
+                    const flow = new CustomFlow(fConf.sourceUid, fConf.targetUid);
+                    Object.assign(flow.params, fConf.params);
+                    customFlows.push(flow);
+                    flow.buildGUI(customFlowFolder);
+                    flow.update();
+                });
+            }
+            
+            // Re-sync GUI controllers
+            gui.controllersRecursive().forEach(c => c.updateDisplay());
+            updateAllFlows();
+            refreshFlowDropdowns();
+        }
+
+
+        // --- BOOTSTRAP ---
+        app.addManifold(); // Start with one
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+</html>
